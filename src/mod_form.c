@@ -186,12 +186,12 @@ static ap_form_pair_t *do_form_body_fixup(request_rec *r, ap_form_pair_t *pair,
 
         switch(entry->action) {
             case form_unset:
-                return do_unset(r, entry, pair);
+                if (do_unset(r, entry, pair) == NULL)
+                    return NULL;
             case form_edit:
                 pair = do_edit(r, entry, pair);
-                break;
             default:
-                break;
+                continue;
         }
     }
 
@@ -223,10 +223,11 @@ static int parse_form_data_fixup(request_rec *r)
 
     if (r->method_number == M_POST && ap_is_initial_req(r)) {
         res = ap_parse_form_data(r, NULL, &pairs, -1, HUGE_STRING_LEN);
-        out = apr_brigade_create(r->pool, r->connection->bucket_alloc);
 
-        if (pairs == NULL)
+        if (pairs == NULL || apr_is_empty_array(pairs))
             return OK;
+
+        out = apr_brigade_create(r->pool, r->connection->bucket_alloc);
 
         for (i = 0; i < pairs->nelts; ++i) {
             apr_bucket *b;
