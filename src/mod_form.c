@@ -208,10 +208,7 @@ static ap_form_pair_t *do_form_body_fixup(request_rec *r, ap_form_pair_t *pair,
 static int parse_form_data_fixup(request_rec *r)
 {
     apr_array_header_t *pairs = NULL;
-    apr_off_t len;
-    apr_size_t size;
     int res = OK;
-    char *buffer;
     apr_status_t rv;
     form_conf *conf = (form_conf *) ap_get_module_config(r->per_dir_config,
                                                          &form_module);
