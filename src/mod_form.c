@@ -200,29 +200,36 @@ static ap_form_pair_t *do_form_body_fixup(request_rec *r, ap_form_pair_t *pair,
 
 
 /**
- * Fixup hook that reads and parses the POSTed form data. This depends on the
+ * Handler that reads and parses the POSTed form data. This depends on the
  * request module so that the body can be read multiple times.
+ *
+ * This is a handler instead of a fixup because we depend on mod_charset_lite
+ * which use filters for translations. Note that the handler returns DECLINED
+ * so that other handlers still run.
+ *
  * @param r the request record
- * @return fixup return code
+ * @return handler return code
  */
-static int parse_form_data_fixup(request_rec *r)
+static int form_data_handler(request_rec *r)
 {
     apr_array_header_t *pairs = NULL;
     int res = OK;
     apr_status_t rv;
     form_conf *conf = (form_conf *) ap_get_module_config(r->per_dir_config,
                                                          &form_module);
+
+    /* Bail if there are no configured rules. */
+    if (conf->fixup_data->nelts <= 0)
+        return DECLINED;
+
     apr_bucket_brigade *out;
     int i = 0;
-
-    /* Insert request filter to read the request body */
-    ap_request_insert_filter_fn(r);
 
     if (r->method_number == M_POST && ap_is_initial_req(r)) {
         res = ap_parse_form_data(r, NULL, &pairs, -1, HUGE_STRING_LEN);
 
         if (pairs == NULL || apr_is_empty_array(pairs))
-            return OK;
+            return DECLINED;
 
         out = apr_brigade_create(r->pool, r->connection->bucket_alloc);
 
@@ -248,16 +255,19 @@ static int parse_form_data_fixup(request_rec *r)
                 ap_log_rerror(APLOG_MARK, APLOG_TRACE8, rv, r, APLOGNO(03495)
                               "Unable to write pair. No longer parsing request "
                               "data.");
-                return OK;
+                return DECLINED;
             }
         }
 
         APR_BRIGADE_INSERT_TAIL(out,
                 apr_bucket_eos_create(r->connection->bucket_alloc));
         r->kept_body = out;
+
+        /* Insert kept_body request filter. */
+        ap_request_insert_filter_fn(r);
     }
 
-    return OK;
+    return DECLINED;
 }
 
 
@@ -434,8 +444,8 @@ static void register_hooks(apr_pool_t *p)
     /* Insert our form_filter if it is not already set. */
     ap_hook_insert_filter(insert_filter, NULL, NULL, APR_HOOK_MIDDLE);
 
-    /* Fixup to read and parse the POSTed request body. */
-    ap_hook_fixups(parse_form_data_fixup, NULL, NULL, APR_HOOK_LAST);
+    /* Handler to read and parse the POSTed request body. */
+    ap_hook_handler(form_data_handler, NULL, NULL, APR_HOOK_FIRST);
 }
 
 
