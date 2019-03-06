@@ -305,7 +305,7 @@ static int form_post_config(apr_pool_t *pconf, apr_pool_t *plog,
 
         if (!ap_request_insert_filter_fn || !ap_request_remove_filter_fn) {
             ap_log_error(APLOG_MARK, APLOG_CRIT, 0, NULL, APLOGNO(03496)
-                    "You must load mod_request to enable the mod_auth_form "
+                    "You must load mod_request to enable the mod_form "
                     "functions");
             return !OK;
         }
