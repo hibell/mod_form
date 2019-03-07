@@ -218,45 +218,45 @@ static int form_data_handler(request_rec *r)
     form_conf *conf = (form_conf *) ap_get_module_config(r->per_dir_config,
                                                          &form_module);
 
-    /* Bail if there are no configured rules. */
-    if (conf->fixup_data->nelts <= 0)
+    /* Bail if there are no configured rules or if the handler should not run. */
+    if (r->method_number != M_POST || !ap_is_initial_req(r) ||
+            conf->fixup_data->nelts <= 0 ||
+            strcasecmp(r->content_type, "application/x-www-form-urlencoded") != 0)
         return DECLINED;
 
     apr_bucket_brigade *out;
     int i = 0;
 
-    if (r->method_number == M_POST && ap_is_initial_req(r)) {
-        res = ap_parse_form_data(r, NULL, &pairs, -1, HUGE_STRING_LEN);
+    res = ap_parse_form_data(r, NULL, &pairs, -1, HUGE_STRING_LEN);
 
-        if (pairs == NULL || apr_is_empty_array(pairs))
+    if (pairs == NULL || apr_is_empty_array(pairs))
+        return DECLINED;
+
+    out = apr_brigade_create(r->pool, r->connection->bucket_alloc);
+
+    for (i = 0; i < pairs->nelts; ++i) {
+        apr_bucket *b;
+        ap_form_pair_t *pair =
+                (ap_form_pair_t *) &((ap_form_pair_t *) (pairs->elts))[i];
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE8, res, r, APLOGNO(03494)
+                "found form data pair -> %s", pair->name);
+
+        pair = do_form_body_fixup(r, pair, conf);
+
+        if (pair == NULL)
+            continue;
+
+        if (strncmp(pair->name, "username", 8) == 0) {
+            r->user = get_post_form_value(r->pool, pair);
+        }
+
+
+        rv = write_form_pair(out, r, pair, i >= pairs->nelts - 1);
+        if (rv != APR_SUCCESS) {
+            ap_log_rerror(APLOG_MARK, APLOG_TRACE8, rv, r, APLOGNO(03495)
+                    "Unable to write pair. No longer parsing request "
+                    "data.");
             return DECLINED;
-
-        out = apr_brigade_create(r->pool, r->connection->bucket_alloc);
-
-        for (i = 0; i < pairs->nelts; ++i) {
-            apr_bucket *b;
-            ap_form_pair_t *pair =
-                    (ap_form_pair_t *) &((ap_form_pair_t *) (pairs->elts))[i];
-            ap_log_rerror(APLOG_MARK, APLOG_TRACE8, res, r, APLOGNO(03494)
-                          "found form data pair -> %s", pair->name);
-
-            pair = do_form_body_fixup(r, pair, conf);
-
-            if (pair == NULL)
-                continue;
-
-            if (strncmp(pair->name, "username", 8) == 0) {
-                r->user = get_post_form_value(r->pool, pair);
-            }
-
-
-            rv = write_form_pair(out, r, pair, i >= pairs->nelts - 1);
-            if (rv != APR_SUCCESS) {
-                ap_log_rerror(APLOG_MARK, APLOG_TRACE8, rv, r, APLOGNO(03495)
-                              "Unable to write pair. No longer parsing request "
-                              "data.");
-                return DECLINED;
-            }
         }
 
         APR_BRIGADE_INSERT_TAIL(out,
