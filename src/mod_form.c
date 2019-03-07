@@ -59,7 +59,7 @@ static void (*ap_request_insert_filter_fn) (request_rec * r) = NULL;
 static void (*ap_request_remove_filter_fn) (request_rec * r) = NULL;
 
 
-static const char *get_post_form_value(apr_pool_t *pool, ap_form_pair_t *pair);
+static const char *get_form_value(apr_pool_t *pool, ap_form_pair_t *pair);
 static const char *process_regexp(request_rec *r, form_entry *entry,
                                   const char *value);
 
@@ -135,8 +135,8 @@ static const char *do_edit(request_rec *r, form_entry *entry,
  * @param conf the form conf
  * @return NULL if the pair was unset. Otherwise, it returns the new pair's value.
  */
-static const char *do_form_body_fixup(request_rec *r, const char *name,
-                                      const char *value, form_conf *conf)
+static const char *do_form_fixup(request_rec *r, const char *name,
+                                 const char *value, form_conf *conf)
 {
     int i;
 
@@ -186,7 +186,8 @@ static int form_data_handler(request_rec *r)
     apr_size_t len;
 
     /* Bail if there are no configured rules or if the handler shouldn't run. */
-    if (r->method_number != M_POST || !ap_is_initial_req(r) || conf->fixup_data->nelts <= 0)
+    if (r->method_number != M_POST || !ap_is_initial_req(r) ||
+            conf->fixup_data->nelts <= 0)
         return DECLINED;
 
     /* Check to make sure its a URL encoded payload. */
@@ -210,8 +211,7 @@ static int form_data_handler(request_rec *r)
                 "found form data pair -> %s", name);
 
         /* Read the value of data. */
-        value = do_form_body_fixup(r, name,
-                                   get_post_form_value(r->pool, pair), conf);
+        value = do_form_fixup(r, name, get_form_value(r->pool, pair), conf);
 
         if (value == NULL)
             continue;
@@ -268,7 +268,7 @@ static int form_data_handler(request_rec *r)
  * @param pair form pair
  * @return value as a string
  */
-static const char *get_post_form_value(apr_pool_t *pool, ap_form_pair_t *pair)
+static const char *get_form_value(apr_pool_t *pool, ap_form_pair_t *pair)
 {
     apr_off_t len;
     apr_size_t size;
