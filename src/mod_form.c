@@ -19,7 +19,6 @@
 #include <http_log.h>
 #include <apr_strings.h>
 #include <apr_general.h>
-#include <util_filter.h>
 #include <apr_buckets.h>
 #include <http_request.h>
 #include <http_protocol.h>
@@ -56,9 +55,6 @@ typedef struct {
 } form_conf;
 
 
-static const char *form_filter_name = "form_body";
-static ap_filter_rec_t *form_filter_handle;
-
 static void (*ap_request_insert_filter_fn) (request_rec * r) = NULL;
 static void (*ap_request_remove_filter_fn) (request_rec * r) = NULL;
 
@@ -81,42 +77,6 @@ static form_action parse_action(const char *action)
         return form_edit;
 
     return form_invalid;
-}
-
-
-/**
- * Example input filter that rejects users trying to authenticate using admin.
- * @param f
- * @param bb
- * @param mode
- * @param block
- * @param readbytes
- * @return
- */
-static apr_status_t form_filter(ap_filter_t *f,
-                                apr_bucket_brigade *bb,
-                                ap_input_mode_t mode,
-                                apr_read_type_e block,
-                                apr_off_t readbytes)
-{
-    const char *user = f->r->user;
-
-    ap_remove_input_filter(f);
-
-    if (user && strncmp(user, "blocked_user", 12) == 0) {
-        apr_bucket *e;
-        ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0, f->r, APLOGNO(03491)
-                      "Someone tried to login as a blocked user '%s'."
-                      "Forbidding.", user);
-        e = ap_bucket_error_create(HTTP_FORBIDDEN, NULL, f->r->pool,
-                                   f->c->bucket_alloc);
-        APR_BRIGADE_INSERT_TAIL(bb, e);
-        e = apr_bucket_eos_create(f->c->bucket_alloc);
-        APR_BRIGADE_INSERT_TAIL(bb, e);
-        return ap_pass_brigade(f->r->output_filters, bb);
-    }
-
-    return ap_get_brigade(f->next, bb, mode, block, readbytes);
 }
 
 
@@ -259,6 +219,13 @@ static int form_data_handler(request_rec *r)
         /* Special handling for username field */
         if (strncmp(name, "username", 8) == 0) {
             r->user = (char *) value;
+
+            if (r->user && strncmp(r->user, "blocked_user", 12) == 0) {
+                ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0, r, APLOGNO(03491)
+                        "Someone tried to login as a blocked user '%s'. "
+                        "Forbidding.", r->user);
+                return HTTP_FORBIDDEN;
+            }
         }
 
 #ifdef __MVS__
@@ -361,39 +328,6 @@ static const char *process_regexp(request_rec *r, form_entry *entry,
     strcpy(ret + pmatch[0].rm_so, subs);
     strcat(ret, remainder);
     return ret;
-}
-
-
-/**
- * Check whether an input filter is present in the input filter chain already or
- * not.
- * @param r request record
- * @param fn filter record
- * @return TRUE or FALSE depending on if filter is present or not
- */
-static int filter_present(request_rec * r, ap_filter_rec_t *fn)
-{
-    ap_filter_t * f = r->input_filters;
-    while (f) {
-        if (f->frec == fn) {
-            return TRUE;
-        }
-        f = f->next;
-    }
-    return FALSE;
-}
-
-
-/**
- * Insert filter hook. Add the form_filter if it is not already added.
- * @param r The request
- */
-static void insert_filter(request_rec * r)
-{
-    if (!filter_present(r, form_filter_handle)) {
-        ap_add_input_filter_handle(form_filter_handle, NULL, r,
-                                   r->connection);
-    }
 }
 
 
@@ -532,15 +466,6 @@ static void register_hooks(apr_pool_t *p)
      * and ap_request_remove_filter.
      */
     ap_hook_post_config(form_post_config, NULL, NULL, APR_HOOK_MIDDLE);
-
-    /* Register the input filter to deny admin users. */
-    form_filter_handle = ap_register_input_filter(form_filter_name,
-                                                  form_filter,
-                                                  NULL,
-                                                  AP_FTYPE_RESOURCE);
-
-    /* Insert our form_filter if it is not already set. */
-    ap_hook_insert_filter(insert_filter, NULL, NULL, APR_HOOK_MIDDLE);
 
     /* Handler to read and parse the POSTed request body. */
     ap_hook_handler(form_data_handler, NULL, NULL, APR_HOOK_FIRST);
