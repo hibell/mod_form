@@ -14,17 +14,17 @@
  * limitations under the License.
  */
 
-#include "httpd.h"
-#include "http_config.h"
-#include "http_log.h"
-#include "apr_strings.h"
-#include "apr_general.h"
-#include "util_filter.h"
-#include "apr_buckets.h"
-#include "http_request.h"
-#include "http_protocol.h"
+#include <httpd.h>
+#include <http_config.h>
+#include <http_log.h>
+#include <apr_strings.h>
+#include <apr_general.h>
+#include <util_filter.h>
+#include <apr_buckets.h>
+#include <http_request.h>
+#include <http_protocol.h>
 
-#include "mod_request.h"
+#include <mod_request.h>
 
 
 /******************************************************************************
