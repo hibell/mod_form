@@ -27,16 +27,11 @@
 #include <mod_request.h>
 
 
-/******************************************************************************
- * DATA TYPES & VARIABLES                                                     *
- *****************************************************************************/
+#define UNUSED(x) (void) (x)
+
+
 module AP_MODULE_DECLARE_DATA form_module;
 
-static const char *form_filter_name = "form_body";
-static ap_filter_rec_t *form_filter_handle;
-
-static void (*ap_request_insert_filter_fn) (request_rec * r) = NULL;
-static void (*ap_request_remove_filter_fn) (request_rec * r) = NULL;
 
 typedef enum {
     form_invalid,
@@ -56,9 +51,14 @@ typedef struct {
     apr_array_header_t *fixup_data;
 } form_conf;
 
-/******************************************************************************
- * PROTOTYPES                                                                 *
- *****************************************************************************/
+
+static const char *form_filter_name = "form_body";
+static ap_filter_rec_t *form_filter_handle;
+
+static void (*ap_request_insert_filter_fn) (request_rec * r) = NULL;
+static void (*ap_request_remove_filter_fn) (request_rec * r) = NULL;
+
+
 static apr_bucket *process_regexp_pair(request_rec *r, form_entry *entry,
                                        ap_form_pair_t *pair);
 static char *get_post_form_value(apr_pool_t *pool, ap_form_pair_t *pair);
@@ -212,11 +212,12 @@ static ap_form_pair_t *do_form_body_fixup(request_rec *r, ap_form_pair_t *pair,
  */
 static int form_data_handler(request_rec *r)
 {
-    apr_array_header_t *pairs = NULL;
-    int res = OK;
-    apr_status_t rv;
     form_conf *conf = (form_conf *) ap_get_module_config(r->per_dir_config,
                                                          &form_module);
+    apr_bucket_brigade *out;
+    apr_array_header_t *pairs = NULL;
+    apr_status_t rv;
+    int res, i;
 
     /* Bail if there are no configured rules or if the handler should not run. */
     if (r->method_number != M_POST || !ap_is_initial_req(r) ||
@@ -224,10 +225,8 @@ static int form_data_handler(request_rec *r)
             strcasecmp(r->content_type, "application/x-www-form-urlencoded") != 0)
         return DECLINED;
 
-    apr_bucket_brigade *out;
-    int i = 0;
-
-    res = ap_parse_form_data(r, NULL, &pairs, -1, HUGE_STRING_LEN);
+    /* Parse the form data */
+    res = ap_parse_form_data(r, NULL, &pairs, (apr_size_t) -1, HUGE_STRING_LEN);
 
     if (pairs == NULL || apr_is_empty_array(pairs))
         return DECLINED;
@@ -235,9 +234,7 @@ static int form_data_handler(request_rec *r)
     out = apr_brigade_create(r->pool, r->connection->bucket_alloc);
 
     for (i = 0; i < pairs->nelts; ++i) {
-        apr_bucket *b;
-        ap_form_pair_t *pair =
-                (ap_form_pair_t *) &((ap_form_pair_t *) (pairs->elts))[i];
+        ap_form_pair_t *pair = &((ap_form_pair_t *) (pairs->elts))[i];
         ap_log_rerror(APLOG_MARK, APLOG_TRACE8, res, r, APLOGNO(03494)
                 "found form data pair -> %s", pair->name);
 
@@ -295,6 +292,123 @@ static apr_status_t write_form_pair(apr_bucket_brigade *out,
     return APR_SUCCESS;
 }
 
+
+/**
+ * Insert filter hook. Add the form_filter if it is not already added.
+ * @param r The request
+ */
+static void insert_filter(request_rec * r)
+{
+    if (!filter_present(r, form_filter_handle)) {
+        ap_add_input_filter_handle(form_filter_handle, NULL, r,
+                                   r->connection);
+    }
+}
+
+
+/**
+ * Get the value from a pair.
+ * @param pool the pool to allocate the return value from
+ * @param pair form pair
+ * @return value as a string
+ */
+static char *get_post_form_value(apr_pool_t *pool, ap_form_pair_t *pair)
+{
+    apr_off_t len;
+    apr_size_t size;
+    char *buffer;
+
+    apr_brigade_length(pair->value, 1, &len);
+    size = (apr_size_t) len;
+    buffer = apr_palloc(pool, size + 1);
+    apr_brigade_flatten(pair->value, buffer, &size);
+    buffer[len] = '\0';
+
+    return buffer;
+}
+
+/**
+ * Process a regex and perform substitution as needed.
+ * @param r request record
+ * @param entry form_entry to process
+ * @param value to process
+ * @return the substituted string
+ */
+static const char *process_regexp(request_rec *r, form_entry *entry,
+                                  const char *value)
+{
+    ap_regmatch_t pmatch[AP_MAX_REG_MATCH];
+    const char *subs;
+    const char *remainder;
+    char *ret;
+    apr_size_t diffsz;
+
+    if (ap_regexec(entry->regex, value, AP_MAX_REG_MATCH, pmatch, 0)) {
+        /* no match, nothing to do */
+        return value;
+    }
+
+    /* Process tags in the input string rather than the resulting
+     * substitution to avoid surprises
+     */
+    subs = ap_pregsub(r->pool, entry->subst, value, AP_MAX_REG_MATCH, pmatch);
+    if (subs == NULL)
+        return NULL;
+
+    diffsz = strlen(subs) - (pmatch[0].rm_eo - pmatch[0].rm_so);
+    if (entry->action == form_edit) {
+        remainder = value + pmatch[0].rm_eo;
+    }
+    else { /* recurse to edit multiple matches if applicable */
+        remainder = process_regexp(r, entry, value + pmatch[0].rm_eo);
+        if (remainder == NULL)
+            return NULL;
+        diffsz += strlen(remainder) - strlen(value + pmatch[0].rm_eo);
+    }
+
+    ret = apr_palloc(r->pool, strlen(value) + 1 + diffsz);
+    memcpy(ret, value, pmatch[0].rm_so);
+    strcpy(ret + pmatch[0].rm_so, subs);
+    strcat(ret, remainder);
+    return ret;
+}
+
+/**
+ * Process a regex and perform substitution as needed.
+ * @param r request record
+ * @param entry form_entry to process
+ * @param pair form pair to process
+ * @return a bucket containing the substituted value
+ */
+static apr_bucket *process_regexp_pair(request_rec *r, form_entry *entry,
+                                       ap_form_pair_t *pair)
+{
+    const char *value = get_post_form_value(r->pool, pair);
+    value = process_regexp(r, entry, value);
+    return apr_bucket_pool_create(value, strlen(value), r->pool,
+                                  r->connection->bucket_alloc);
+}
+
+/**
+ * Check whether an input filter is present in the input filter chain already or
+ * not.
+ * @param r request record
+ * @param fn filter record
+ * @return TRUE or FALSE depending on if filter is present or not
+ */
+static int filter_present(request_rec * r, ap_filter_rec_t *fn)
+{
+    ap_filter_t * f = r->input_filters;
+    while (f) {
+        if (f->frec == fn) {
+            return TRUE;
+        }
+        f = f->next;
+    }
+    return FALSE;
+}
+
+
 /**
  * Retrieve the mod_request functions to register/remove the request_insert
  * filters
@@ -307,6 +421,11 @@ static apr_status_t write_form_pair(apr_bucket_brigade *out,
 static int form_post_config(apr_pool_t *pconf, apr_pool_t *plog,
                             apr_pool_t *ptemp, server_rec *s)
 {
+    UNUSED(pconf);
+    UNUSED(plog);
+    UNUSED(ptemp);
+    UNUSED(s);
+
     if (!ap_request_insert_filter_fn || !ap_request_remove_filter_fn) {
         ap_request_insert_filter_fn =
                 APR_RETRIEVE_OPTIONAL_FN(ap_request_insert_filter);
@@ -325,11 +444,12 @@ static int form_post_config(apr_pool_t *pconf, apr_pool_t *plog,
 }
 
 
-
-
 static void *config_dir_create(apr_pool_t *p, char *d)
 {
-    form_conf *conf = (form_conf *) apr_pcalloc(p, sizeof(*conf));
+    form_conf *conf;
+    UNUSED(d);
+
+    conf = (form_conf *) apr_pcalloc(p, sizeof(*conf));
     conf->fixup_data = apr_array_make(p, 2, sizeof(form_entry));
     return (void *) conf;
 }
@@ -337,14 +457,14 @@ static void *config_dir_create(apr_pool_t *p, char *d)
 
 static void *config_dir_merge(apr_pool_t *p, void *basev, void *overridesv)
 {
-    form_conf *newconf = apr_pcalloc(p, sizeof(*newconf));
+    form_conf *new_conf = apr_pcalloc(p, sizeof(*new_conf));
     form_conf *base = basev;
     form_conf *overrides = overridesv;
 
-    newconf->fixup_data = apr_array_append(p, base->fixup_data,
-                                           overrides->fixup_data);
+    new_conf->fixup_data = apr_array_append(p, base->fixup_data,
+                                            overrides->fixup_data);
 
-    return (void *) newconf;
+    return (void *) new_conf;
 }
 
 
@@ -415,20 +535,10 @@ static const command_rec command_table[] = {
 };
 
 
-/**
- * Insert filter hook. Add the form_filter if it is not already added.
- * @param r The request
- */
-static void insert_filter(request_rec * r)
-{
-    if (!filter_present(r, form_filter_handle)) {
-        ap_add_input_filter_handle(form_filter_handle, NULL, r,
-                                   r->connection);
-    }
-}
-
 static void register_hooks(apr_pool_t *p)
 {
+    UNUSED(p);
+
     /*
      * Retrieve the mod_request functions ap_request_insert_filter
      * and ap_request_remove_filter.
@@ -449,7 +559,6 @@ static void register_hooks(apr_pool_t *p)
 }
 
 
-
 AP_DECLARE_MODULE(form) = {
     STANDARD20_MODULE_STUFF,
     config_dir_create,          /* dir config create   */
@@ -459,110 +568,3 @@ AP_DECLARE_MODULE(form) = {
     command_table,              /* command table       */
     register_hooks              /* register hooks      */
 };
-
-
-/******************************************************************************
- * HELPER FUNCTIONS                                                           *
- *****************************************************************************/
-
-/**
- * Get the value from a pair.
- * @param pool the pool to allocate the return value from
- * @param pair form pair
- * @return value as a string
- */
-static char *get_post_form_value(apr_pool_t *pool, ap_form_pair_t *pair)
-{
-    apr_off_t len;
-    apr_size_t size;
-    char *buffer;
-
-    apr_brigade_length(pair->value, 1, &len);
-    size = (apr_size_t) len;
-    buffer = apr_palloc(pool, size + 1);
-    apr_brigade_flatten(pair->value, buffer, &size);
-    buffer[len] = '\0';
-
-    return buffer;
-}
-
-/**
- * Process a regex and perform substitution as needed.
- * @param r request record
- * @param entry form_entry to process
- * @param value to process
- * @return the substituted string
- */
-static const char *process_regexp(request_rec *r, form_entry *entry,
-                                  const char *value)
-{
-    ap_regmatch_t pmatch[AP_MAX_REG_MATCH];
-    const char *subs;
-    const char *remainder;
-    char *ret;
-    int diffsz;
-
-    if (ap_regexec(entry->regex, value, AP_MAX_REG_MATCH, pmatch, 0)) {
-        /* no match, nothing to do */
-        return value;
-    }
-
-    /* Process tags in the input string rather than the resulting
-     * substitution to avoid surprises
-     */
-    subs = ap_pregsub(r->pool, entry->subst, value, AP_MAX_REG_MATCH, pmatch);
-    if (subs == NULL)
-        return NULL;
-
-    diffsz = strlen(subs) - (pmatch[0].rm_eo - pmatch[0].rm_so);
-    if (entry->action == form_edit) {
-        remainder = value + pmatch[0].rm_eo;
-    }
-    else { /* recurse to edit multiple matches if applicable */
-        remainder = process_regexp(r, entry, value + pmatch[0].rm_eo);
-        if (remainder == NULL)
-            return NULL;
-        diffsz += strlen(remainder) - strlen(value + pmatch[0].rm_eo);
-    }
-
-    ret = apr_palloc(r->pool, strlen(value) + 1 + diffsz);
-    memcpy(ret, value, pmatch[0].rm_so);
-    strcpy(ret + pmatch[0].rm_so, subs);
-    strcat(ret, remainder);
-    return ret;
-}
-
-/**
- * Process a regex and perform substitution as needed.
- * @param r request record
- * @param entry form_entry to process
- * @param pair form pair to process
- * @return a bucket containing the substituted value
- */
-static apr_bucket *process_regexp_pair(request_rec *r, form_entry *entry,
-                                       ap_form_pair_t *pair)
-{
-    const char *value = get_post_form_value(r->pool, pair);
-    value = process_regexp(r, entry, value);
-    return apr_bucket_pool_create(value, strlen(value), r->pool,
-                                  r->connection->bucket_alloc);
-}
-
-/**
- * Check whether an input filter is present in the input filter chain already or
- * not.
- * @param r request record
- * @param fn filter record
- * @return TRUE or FALSE depending on if filter is present or not
- */
-static int filter_present(request_rec * r, ap_filter_rec_t *fn)
-{
-    ap_filter_t * f = r->input_filters;
-    while (f) {
-        if (f->frec == fn) {
-            return TRUE;
-        }
-        f = f->next;
-    }
-    return FALSE;
-}
