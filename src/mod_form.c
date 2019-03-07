@@ -221,6 +221,7 @@ static int form_data_handler(request_rec *r)
     apr_array_header_t *pairs = NULL;
     apr_status_t rv;
     int res, i;
+    const char *name;
     const char *value;
     apr_size_t len;
 
@@ -243,28 +244,31 @@ static int form_data_handler(request_rec *r)
 
     for (i = 0; i < pairs->nelts; ++i) {
         ap_form_pair_t *pair = &((ap_form_pair_t *) (pairs->elts))[i];
+        name = pair->name;
+
         ap_log_rerror(APLOG_MARK, APLOG_TRACE8, res, r, APLOGNO(03494)
-                "found form data pair -> %s", pair->name);
+                "found form data pair -> %s", name);
 
         /* Read the value of data. */
-        value = do_form_body_fixup(r, pair->name,
+        value = do_form_body_fixup(r, name,
                                    get_post_form_value(r->pool, pair), conf);
 
         if (value == NULL)
             continue;
 
         /* Special handling for username field */
-        if (strncmp(pair->name, "username", 8) == 0) {
+        if (strncmp(name, "username", 8) == 0) {
             r->user = (char *) value;
         }
 
 #ifdef __MVS__
         /* Request body should be translated back to ASCII. */
-        ap_xlate_proto_to_ascii((char *) pair->name, strlen(pair->name));
+        ap_xlate_proto_to_ascii((char *) name, strlen(name));
         ap_xlate_proto_to_ascii((char *) value, strlen(value));
 #endif
+
         /* URL-encode data */
-        rv = apr_brigade_printf(out, NULL, NULL, "%s%c%s%c", pair->name, eq, value, amp);
+        rv = apr_brigade_printf(out, NULL, NULL, "%s%c%s%c", name, eq, value, amp);
         if (rv != APR_SUCCESS) {
             ap_log_rerror(APLOG_MARK, APLOG_TRACE8, rv, r, APLOGNO(03495)
                     "Unable to write pair. No longer parsing request data.");
