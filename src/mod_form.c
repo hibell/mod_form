@@ -26,6 +26,10 @@
 
 #include <mod_request.h>
 
+#ifdef __MVS__
+#include <util_ebcdic.h>
+#endif
+
 
 #define UNUSED(x) (void) (x)
 
@@ -59,14 +63,9 @@ static void (*ap_request_insert_filter_fn) (request_rec * r) = NULL;
 static void (*ap_request_remove_filter_fn) (request_rec * r) = NULL;
 
 
-static apr_bucket *process_regexp_pair(request_rec *r, form_entry *entry,
-                                       ap_form_pair_t *pair);
-static char *get_post_form_value(apr_pool_t *pool, ap_form_pair_t *pair);
-static int filter_present(request_rec *r, ap_filter_rec_t *fn);
-static apr_status_t write_form_pair(apr_bucket_brigade *out,
-                                    request_rec *r,
-                                    ap_form_pair_t *pair,
-                                    int last);
+static const char *get_post_form_value(apr_pool_t *pool, ap_form_pair_t *pair);
+static const char *process_regexp(request_rec *r, form_entry *entry,
+                                  const char *value);
 
 
 /**
@@ -126,21 +125,22 @@ static apr_status_t form_filter(ap_filter_t *f,
  * be used to unset all form pairs whose name matches the regex.
  * @param r request record
  * @param entry the unset rule to apply
- * @param pair the pair to check
- * @return NULL if pair matched; otherwise the pair is returned.
+ * @param name the name of pair to check
+ * @param value the value of pair
+ * @return NULL if pair matched; otherwise the pair's name is returned.
  */
-static ap_form_pair_t *do_unset(request_rec *r, form_entry *entry,
-                                ap_form_pair_t *pair)
+static const char *do_unset(request_rec *r, form_entry *entry,
+                            const char *name, const char *value)
 {
-    if (!ap_regexec(entry->regex, pair->name, 0, NULL, 0)) {
+    if (!ap_regexec(entry->regex, name, 0, NULL, 0)) {
         ap_log_rerror(APLOG_MARK, APLOG_TRACE8, 0, r, APLOGNO(03492)
                       "Unset rule '%s' matched for form pair '%s'. "
                       "Form pair was unset.",
-                      entry->name, pair->name);
+                      entry->name, name);
         return NULL;
     }
 
-    return pair;
+    return value;
 }
 
 
@@ -149,35 +149,34 @@ static ap_form_pair_t *do_unset(request_rec *r, form_entry *entry,
  * and can be used to
  * @param r
  * @param entry the edit rule to apply
- * @param pair the pair to check
- * @return the edited pair
+ * @param name the name of pair to check
+ * @param value the name of pair to check
+ * @return the edited pair's value
  */
-static ap_form_pair_t *do_edit(request_rec *r, form_entry *entry,
-                               ap_form_pair_t *pair)
+static const char *do_edit(request_rec *r, form_entry *entry,
+                           const char *name, const char *value)
 {
-    if (strcmp(entry->name, pair->name) == 0) {
-        apr_bucket *b = process_regexp_pair(r, entry, pair);
-
-        pair->value = apr_brigade_create(r->pool, r->connection->bucket_alloc);
-        APR_BRIGADE_INSERT_TAIL(pair->value, b);
+    if (strcmp(entry->name, name) == 0) {
+        value = process_regexp(r, entry, value);
         ap_log_rerror(APLOG_MARK, APLOG_TRACE8, 0, r, APLOGNO(03493)
                       "Edit rule '%s' matched for form pair '%s'. "
                       "Form pair was edited.",
-                      entry->value, pair->name);
+                      entry->value, name);
     }
 
-    return pair;
+    return value;
 }
 
 /**
  * Iterate through each rule and apply it.
  * @param r the request record
- * @param pair the form pair to process
+ * @param name the name of form pair to process
+ * @param value the value of form pair to process
  * @param conf the form conf
- * @return the new pair
+ * @return NULL if the pair was unset. Otherwise, it returns the new pair's value.
  */
-static ap_form_pair_t *do_form_body_fixup(request_rec *r, ap_form_pair_t *pair,
-                                          form_conf *conf)
+static const char *do_form_body_fixup(request_rec *r, const char *name,
+                                      const char *value, form_conf *conf)
 {
     int i;
 
@@ -186,16 +185,16 @@ static ap_form_pair_t *do_form_body_fixup(request_rec *r, ap_form_pair_t *pair,
 
         switch(entry->action) {
             case form_unset:
-                if (do_unset(r, entry, pair) == NULL)
+                if (do_unset(r, entry, name, value) == NULL)
                     return NULL;
             case form_edit:
-                pair = do_edit(r, entry, pair);
+                value = do_edit(r, entry, name, value);
             default:
                 continue;
         }
     }
 
-    return pair;
+    return value;
 }
 
 
@@ -212,17 +211,26 @@ static ap_form_pair_t *do_form_body_fixup(request_rec *r, ap_form_pair_t *pair,
  */
 static int form_data_handler(request_rec *r)
 {
+    static const char eq = 0x3D;   /* ASCII '=' */
+    static const char amp = 0x26;  /* ASCII '&' */
+
     form_conf *conf = (form_conf *) ap_get_module_config(r->per_dir_config,
                                                          &form_module);
     apr_bucket_brigade *out;
+    apr_bucket *b;
     apr_array_header_t *pairs = NULL;
     apr_status_t rv;
     int res, i;
+    const char *value;
+    apr_size_t len;
 
-    /* Bail if there are no configured rules or if the handler should not run. */
-    if (r->method_number != M_POST || !ap_is_initial_req(r) ||
-            conf->fixup_data->nelts <= 0 ||
-            strcasecmp(r->content_type, "application/x-www-form-urlencoded") != 0)
+    /* Bail if there are no configured rules or if the handler shouldn't run. */
+    if (r->method_number != M_POST || !ap_is_initial_req(r) || conf->fixup_data->nelts <= 0)
+        return DECLINED;
+
+    /* Check to make sure its a URL encoded payload. */
+    value = apr_table_get(r->headers_in, "Content-Type");
+    if (!value || strncasecmp("application/x-www-form-urlencoded", value, 33) != 0)
         return DECLINED;
 
     /* Parse the form data */
@@ -238,71 +246,48 @@ static int form_data_handler(request_rec *r)
         ap_log_rerror(APLOG_MARK, APLOG_TRACE8, res, r, APLOGNO(03494)
                 "found form data pair -> %s", pair->name);
 
-        pair = do_form_body_fixup(r, pair, conf);
+        /* Read the value of data. */
+        value = do_form_body_fixup(r, pair->name,
+                                   get_post_form_value(r->pool, pair), conf);
 
-        if (pair == NULL)
+        if (value == NULL)
             continue;
 
+        /* Special handling for username field */
         if (strncmp(pair->name, "username", 8) == 0) {
-            r->user = get_post_form_value(r->pool, pair);
+            r->user = (char *) value;
         }
 
-
-        rv = write_form_pair(out, r, pair, i >= pairs->nelts - 1);
+#ifdef __MVS__
+        /* Request body should be translated back to ASCII. */
+        ap_xlate_proto_to_ascii((char *) pair->name, strlen(pair->name));
+        ap_xlate_proto_to_ascii((char *) value, strlen(value));
+#endif
+        /* URL-encode data */
+        rv = apr_brigade_printf(out, NULL, NULL, "%s%c%s%c", pair->name, eq, value, amp);
         if (rv != APR_SUCCESS) {
             ap_log_rerror(APLOG_MARK, APLOG_TRACE8, rv, r, APLOGNO(03495)
-                    "Unable to write pair. No longer parsing request "
-                    "data.");
+                    "Unable to write pair. No longer parsing request data.");
             return DECLINED;
         }
-
-        APR_BRIGADE_INSERT_TAIL(out,
-                apr_bucket_eos_create(r->connection->bucket_alloc));
-        r->kept_body = out;
-
-        /* Insert kept_body request filter. */
-        ap_request_insert_filter_fn(r);
     }
+
+    /* Remove the final trailing '&' from the last bucket that was inserted. */
+    b = APR_BRIGADE_LAST(out);
+    if (apr_bucket_read(b, &value, &len, APR_BLOCK_READ) == APR_SUCCESS) {
+        apr_bucket_split(b, len - 1);
+        b = APR_BUCKET_NEXT(b);
+        APR_BUCKET_REMOVE(b);
+    }
+
+    APR_BRIGADE_INSERT_TAIL(out,
+                            apr_bucket_eos_create(r->connection->bucket_alloc));
+    r->kept_body = out;
+
+    /* Insert kept_body request filter. */
+    ap_request_insert_filter_fn(r);
 
     return DECLINED;
-}
-
-
-static apr_status_t write_form_pair(apr_bucket_brigade *out,
-                                    request_rec *r,
-                                    ap_form_pair_t *pair,
-                                    int last)
-{
-    static const char *eq = "=";
-    static const char *amp = "&";
-
-    apr_bucket_alloc_t *alloc = r->connection->bucket_alloc;
-
-    APR_BRIGADE_INSERT_TAIL(out,
-            apr_bucket_pool_create(pair->name, strlen(pair->name),
-            r->pool, alloc));
-    APR_BRIGADE_INSERT_TAIL(out,
-            apr_bucket_immortal_create(eq, 1, alloc));
-    APR_BRIGADE_CONCAT(out, pair->value);
-
-    if (!last)
-        APR_BRIGADE_INSERT_TAIL(out,
-                apr_bucket_immortal_create(amp, 1, alloc));
-
-    return APR_SUCCESS;
-}
-
-
-/**
- * Insert filter hook. Add the form_filter if it is not already added.
- * @param r The request
- */
-static void insert_filter(request_rec * r)
-{
-    if (!filter_present(r, form_filter_handle)) {
-        ap_add_input_filter_handle(form_filter_handle, NULL, r,
-                                   r->connection);
-    }
 }
 
 
@@ -312,7 +297,7 @@ static void insert_filter(request_rec * r)
  * @param pair form pair
  * @return value as a string
  */
-static char *get_post_form_value(apr_pool_t *pool, ap_form_pair_t *pair)
+static const char *get_post_form_value(apr_pool_t *pool, ap_form_pair_t *pair)
 {
     apr_off_t len;
     apr_size_t size;
@@ -326,6 +311,7 @@ static char *get_post_form_value(apr_pool_t *pool, ap_form_pair_t *pair)
 
     return buffer;
 }
+
 
 /**
  * Process a regex and perform substitution as needed.
@@ -373,21 +359,6 @@ static const char *process_regexp(request_rec *r, form_entry *entry,
     return ret;
 }
 
-/**
- * Process a regex and perform substitution as needed.
- * @param r request record
- * @param entry form_entry to process
- * @param pair form pair to process
- * @return a bucket containing the substituted value
- */
-static apr_bucket *process_regexp_pair(request_rec *r, form_entry *entry,
-                                       ap_form_pair_t *pair)
-{
-    const char *value = get_post_form_value(r->pool, pair);
-    value = process_regexp(r, entry, value);
-    return apr_bucket_pool_create(value, strlen(value), r->pool,
-                                  r->connection->bucket_alloc);
-}
 
 /**
  * Check whether an input filter is present in the input filter chain already or
@@ -406,6 +377,19 @@ static int filter_present(request_rec * r, ap_filter_rec_t *fn)
         f = f->next;
     }
     return FALSE;
+}
+
+
+/**
+ * Insert filter hook. Add the form_filter if it is not already added.
+ * @param r The request
+ */
+static void insert_filter(request_rec * r)
+{
+    if (!filter_present(r, form_filter_handle)) {
+        ap_add_input_filter_handle(form_filter_handle, NULL, r,
+                                   r->connection);
+    }
 }
 
 
