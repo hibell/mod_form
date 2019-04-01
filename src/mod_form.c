@@ -228,7 +228,7 @@ static int form_data_handler(request_rec *r)
         ap_xlate_proto_to_ascii((char *) name, strlen(name));
         ap_xlate_proto_to_ascii((char *) value, strlen(value));
 
-        /* URL-encode data */
+        /* URL-encode data. */
         rv = apr_brigade_printf(out, NULL, NULL, "%s%c%s%c", name, eq, value, amp);
         if (rv != APR_SUCCESS) {
             ap_log_rerror(APLOG_MARK, APLOG_TRACE8, rv, r, APLOGNO(03495)
@@ -453,6 +453,8 @@ static const command_rec command_table[] = {
 
 static void register_hooks(apr_pool_t *p)
 {
+    static const char * const aszSucc[]={ "mod_proxy.c", NULL };
+
     UNUSED(p);
 
     /*
@@ -462,7 +464,7 @@ static void register_hooks(apr_pool_t *p)
     ap_hook_post_config(form_post_config, NULL, NULL, APR_HOOK_MIDDLE);
 
     /* Handler to read and parse the POSTed request body. */
-    ap_hook_handler(form_data_handler, NULL, NULL, APR_HOOK_FIRST);
+    ap_hook_handler(form_data_handler, NULL, aszSucc, APR_HOOK_FIRST);
 }
 
 
